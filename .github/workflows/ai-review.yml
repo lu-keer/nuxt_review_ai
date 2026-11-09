@@ -1,0 +1,43 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # 首阶段只处理同仓库 PR；Fork PR 另行设计授权流程。
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    env:
+      REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+    outputs:
+      report: ${{ steps.codex.outputs.final-message }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run project review skill
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/prompts/review.md
+          output-file: review-report.md
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
