@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "code-review": {
+      "source": "huasu-dev/skills",
+      "sourceType": "github",
+      "skillPath": "skills/code-review/SKILL.md",
+      "computedHash": "0f3ff4cec247d3226855ba4ef4bcc5829e184f9e0030c07b512ce25f1a144fc3"
+    },
+    "setup-huasu": {
+      "source": "huasu-dev/skills",
+      "sourceType": "github",
+      "skillPath": "skills/setup-huasu/SKILL.md",
+      "computedHash": "6df49cf31ded91404273dc4daa965d6030f9b60cb555526e7aa4782c67242088"
+    }
+  }
+}

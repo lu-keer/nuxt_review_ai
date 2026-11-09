@@ -1,0 +1,3 @@
+interface:
+  display_name: "华速 Code Review"
+  short_description: "华速 Review diffs with standards and routed local rules"
