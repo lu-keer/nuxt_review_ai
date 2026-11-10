@@ -3,8 +3,10 @@
 import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
+  closeSync,
   lstatSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readlinkSync,
   rmSync,
@@ -25,12 +27,32 @@ function fail(message) {
 }
 
 function runGit(cwd, args, options = {}) {
-  const result = spawnSync('git', args, {
-    cwd,
-    encoding: options.encoding ?? null,
-    input: options.input,
-    maxBuffer: 64 * 1024 * 1024,
-  })
+  let inputDirectory = null
+  let inputFd = null
+  let result
+  try {
+    // Restricted Linux sandboxes can deny shutdown() on Node's stdin socketpair.
+    // A regular file also preserves EOF and NUL-delimited input for check-ignore.
+    if (options.input !== undefined && options.input !== null) {
+      inputDirectory = mkdtempSync(join(tmpdir(), 'code-review-input-'))
+      chmodSync(inputDirectory, TEMP_DIR_MODE)
+      const inputPath = join(inputDirectory, 'stdin')
+      writeFileSync(inputPath, options.input, { mode: TEXT_FILE_MODE, flag: 'wx' })
+      inputFd = openSync(inputPath, 'r')
+    }
+    result = spawnSync('git', args, {
+      cwd,
+      encoding: options.encoding ?? null,
+      stdio: [inputFd ?? 'ignore', 'pipe', 'pipe'],
+      maxBuffer: 64 * 1024 * 1024,
+    })
+  } finally {
+    try {
+      if (inputFd !== null) closeSync(inputFd)
+    } finally {
+      if (inputDirectory) rmSync(inputDirectory, { force: true, recursive: true })
+    }
+  }
   const allowedCodes = options.allowedCodes ?? [0]
 
   if (result.error) throw result.error

@@ -11,6 +11,14 @@
   与工作流的沙箱外探针保持一致。
 - 分别输出 command、status、error.code、error.syscall、error.message、
   stdout 和 stderr，不输出任何密钥或完整环境变量。
+- 保留默认 stdin 管道作为对照，再以 stdio: ['ignore', 'pipe', 'pipe']
+  重跑以上两个探针，分别记录结果。用同样的 ignore stdin 配置执行
+  git rev-parse HEAD 校验版本，不通过默认 stdin 管道调用校验命令。
+- 额外验证文件 stdin：将 Buffer.from('AGENTS.md\0') 写入私有临时文件，
+  以只读文件描述符作为 stdio[0]，执行 git check-ignore --stdin -z --no-index
+  --verbose --non-matching；捕获 stdout、stderr，检查没有 result.error、
+  退出码为 0 或 1，且 stdout 是以 NUL 分隔并保留 AGENTS.md 路径的记录。
+  使用 finally 关闭描述符并删除该临时目录，不输出完整环境变量。
 - 即使探针失败，也保留诊断结果，并按下面流程执行一次快照 helper；
   helper 失败后严格按 Skill 停止，不重试或自行代审。
 

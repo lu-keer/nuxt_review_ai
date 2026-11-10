@@ -37,6 +37,10 @@ jobs:
         with:
           node-version: '24.22.2'
 
+      - name: Verify review snapshot helper on Linux
+        shell: bash
+        run: node --test .agents/skills/code-review/scripts/build-review-manifest.test.mjs
+
       - name: Probe Node child processes outside Codex
         shell: bash
         run: |

@@ -130,6 +130,24 @@ test('filters ignored and tracked-but-ignored paths', (t) => {
   assert.deepEqual(layer(manifest, 'untracked').paths, [])
 })
 
+test('preserves NUL-delimited UTF-8 paths when filtering ignored files', (t) => {
+  const repository = createRepository(t)
+  const ignoredPath = '忽略 文件.txt'
+  const reviewedPath = '保留 文件.txt'
+  write(repository, ignoredPath, 'tracked\n')
+  git(repository, ['add', ignoredPath])
+  git(repository, ['commit', '--quiet', '-m', 'track UTF-8 path'])
+  write(repository, '.gitignore', `${ignoredPath}\n`)
+  write(repository, ignoredPath, 'ignored modification\n')
+  write(repository, reviewedPath, 'review this\n')
+
+  const manifest = runHelper(t, repository)
+
+  assert.deepEqual(manifest.textFiles, ['.gitignore', reviewedPath])
+  assert.deepEqual(layer(manifest, 'unstaged').paths, [])
+  assert.ok(layer(manifest, 'untracked').paths.includes(reviewedPath))
+})
+
 test('excludes documentation from review', (t) => {
   const repository = createRepository(t)
   write(repository, 'docs/guide.md', '# guide\n')
