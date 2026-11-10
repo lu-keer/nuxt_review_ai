@@ -70,6 +70,14 @@ jobs:
           if (failed) process.exitCode = 1
           NODE
 
+      - name: Install sandbox prerequisite
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          command -v bwrap
+          bwrap --version
+
       - name: Run project review skill
         id: codex
         uses: openai/codex-action@v1
