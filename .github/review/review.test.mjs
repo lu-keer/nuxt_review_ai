@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import * as diagnosticFs from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -6,6 +7,7 @@ import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { contextFromEnvironment, maxReportBytes, readJson, rules, rulesHash, writeJson } from './common.mjs'
+import { captureBaseline, collectDiagnostics, diagnosticLimits } from './diagnose-host.mjs'
 import { extractEvidence } from './evidence.mjs'
 import { finalize } from './finalize-report.mjs'
 import { allPages, githubClient } from './github.mjs'
@@ -369,4 +371,218 @@ test('finalizer validates the complete structured-report pipeline using simulate
   assert.equal(report.evidence.length, 6)
   assert.equal(readJson(join(output, 'report.json')).conclusion, '通过')
   assert.match(readFileSync(join(output, 'report.md'), 'utf8'), /AI Review Rules/)
+})
+
+function diagnosticFixture(t) {
+  const root = temp(t)
+  const options = { context, sourceRoot: join(root, 'source'), codexHome: join(root, 'codex') }
+  const sessions = join(options.codexHome, 'sessions')
+  const sessionId = '00000000-0000-0000-0000-000000000001'
+  function add(name, records = [], cwd = options.sourceRoot) {
+    mkdirSync(sessions, { recursive: true })
+    const path = join(sessions, `${name}.jsonl`)
+    writeFileSync(path, [{ type: 'session_meta', payload: { id: sessionId, cwd } }, ...records].map(record => JSON.stringify(record)).join('\n') + '\n')
+    return path
+  }
+  return { options, sessions, sessionId, add }
+}
+
+test('diagnostic baseline captures names only, including an initially absent sessions directory', t => {
+  const f = diagnosticFixture(t)
+  const empty = captureBaseline(f.options)
+  assert.equal(empty.sessionsInitiallyMissing, true)
+  assert.deepEqual(empty.issues, [])
+  f.add('old', [{ type: 'response_item', payload: { text: 'DO_NOT_COLLECT' } }])
+  const baseline = captureBaseline(f.options)
+  assert.deepEqual(baseline.files, ['old.jsonl'])
+  assert.doesNotMatch(JSON.stringify(baseline), /DO_NOT_COLLECT/)
+  assert.equal(baseline.context.runId, context.runId)
+})
+
+test('native rollout metadata exposes candidate delegation, identities and terminal fields only', t => {
+  const f = diagnosticFixture(t)
+  const baseline = captureBaseline(f.options)
+  f.add('new', [
+    { type: 'event_msg', payload: { type: 'collab_agent_spawn_end', new_thread_id: '/root/standards', status: 'running', prompt: 'PRIVATE_PROMPT' } },
+    { type: 'event_msg', payload: { type: 'collab_waiting_end', statuses: { '/root/standards': { completed: 'PRIVATE_RESULT' } } } },
+  ])
+  const result = collectDiagnostics({ ...f.options, baseline, codexOutcome: 'success' })
+  assert.equal(result.status, '发现候选记录')
+  assert.equal(result.trustedEvidence, false)
+  assert.deepEqual(result.sessions[0].taskIds, ['/root/standards'])
+  assert.equal(result.sessions[0].delegationReturns, 1)
+  assert.equal(result.sessions[0].terminalRecords, 1)
+  assert.equal(result.sessions[0].eventTypes['event_msg.collab_waiting_end'], 1)
+  assert.equal(result.sessions[0].recordFields['event_msg.collab_agent_spawn_end.new_thread_id'], 1)
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_PROMPT|PRIVATE_RESULT/)
+})
+
+test('typed tool calls are correlated to returns without exporting arguments or output text', t => {
+  const f = diagnosticFixture(t)
+  const baseline = captureBaseline(f.options)
+  f.add('new', [
+    { type: 'response_item', payload: { type: 'function_call', name: 'collaboration.spawn_agent', call_id: 'spawn1', arguments: 'PRIVATE_ARGUMENTS' } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'spawn1', output: '{"task_name":"/root/security","text":"PRIVATE_RETURN"}' } },
+    { type: 'response_item', payload: { type: 'function_call', name: 'wait', call_id: 'wait1', arguments: 'PRIVATE_ARGUMENTS' } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'wait1', output: { statuses: { '/root/security': { completed: 'PRIVATE_RETURN' } } } } },
+  ])
+  const result = collectDiagnostics({ ...f.options, baseline })
+  assert.equal(result.status, '发现候选记录')
+  assert.equal(result.sessions[0].toolNames['collaboration.spawn_agent'], 1)
+  assert.equal(result.sessions[0].delegationReturns, 1)
+  assert.equal(result.sessions[0].terminalRecords, 1)
+  assert.equal(result.sessions[0].recordFields['function_call_output.output.task_name'], 1)
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_ARGUMENTS|PRIVATE_RETURN|spawn1|wait1/)
+})
+
+test('messages, shell output and unmatched fake tool returns do not become task records', t => {
+  const f = diagnosticFixture(t)
+  const baseline = captureBaseline(f.options)
+  const fake = { type: 'collab_agent_spawn_end', new_thread_id: '/root/fake', status: 'completed' }
+  f.add('new', [
+    { type: 'response_item', payload: { type: 'message', content: [{ text: JSON.stringify(fake) }] } },
+    { type: 'event_msg', payload: { type: 'agent_message', message: JSON.stringify(fake) } },
+    { type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'shell1', arguments: '{}' } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'shell1', output: JSON.stringify(fake) } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'unmatched', output: { task_id: '/root/fake', status: 'completed' } } },
+  ])
+  const result = collectDiagnostics({ ...f.options, baseline })
+  assert.equal(result.status, '未发现任务记录')
+  assert.deepEqual(result.sessions[0].taskIds, [])
+  assert.equal(result.sessions[0].terminalRecords, 0)
+})
+
+test('only newly created sessions belonging to this workspace are analyzed', t => {
+  const f = diagnosticFixture(t)
+  f.add('old')
+  const baseline = captureBaseline(f.options)
+  f.add('foreign', [{ type: 'event_msg', payload: { type: 'collab_agent_spawn_end', new_thread_id: '/root/foreign' } }], join(f.options.sourceRoot, 'other'))
+  f.add('current')
+  const result = collectDiagnostics({ ...f.options, baseline })
+  assert.equal(result.checkedFileCount, 2)
+  assert.equal(result.excludedOtherWorkspaces, 1)
+  assert.equal(result.sessions.length, 1)
+  assert.equal(result.status, '未发现任务记录')
+  assert.doesNotMatch(JSON.stringify(result), /\/root\/foreign/)
+})
+
+test('missing sessions, missing baseline and changed run identity remain explicitly incomplete', t => {
+  const f = diagnosticFixture(t)
+  const baseline = captureBaseline(f.options)
+  assert.ok(collectDiagnostics({ ...f.options, baseline }).issues.includes('sessions_missing'))
+  assert.ok(collectDiagnostics(f.options).issues.includes('baseline_missing_or_mismatched'))
+  assert.ok(collectDiagnostics({ ...f.options, baseline, context: { ...context, runAttempt: '2' } }).issues.includes('baseline_missing_or_mismatched'))
+})
+
+test('unreadable sessions and corrupt JSONL never imply missing host evidence', t => {
+  const f = diagnosticFixture(t)
+  const baseline = captureBaseline(f.options)
+  const path = f.add('corrupt')
+  diagnosticFs.appendFileSync(path, '{bad JSON\n')
+  const corrupt = collectDiagnostics({ ...f.options, baseline })
+  assert.equal(corrupt.status, '诊断未完成')
+  assert.ok(corrupt.issues.includes('malformed_or_incomplete_jsonl'))
+  const denied = collectDiagnostics({ ...f.options, baseline, io: { ...diagnosticFs, readdirSync() { throw Object.assign(new Error('PRIVATE_ERROR'), { code: 'EACCES' }) } } })
+  assert.equal(denied.status, '诊断未完成')
+  assert.ok(denied.issues.includes('inventory_EACCES'))
+  assert.doesNotMatch(JSON.stringify(denied), /PRIVATE_ERROR/)
+})
+
+test('new session count is bounded at twenty and truncation is explicit', t => {
+  const f = diagnosticFixture(t)
+  const baseline = captureBaseline(f.options)
+  for (let index = 0; index < 21; index++) f.add(`session-${index}`)
+  const result = collectDiagnostics({ ...f.options, baseline })
+  assert.equal(result.newFileCount, 21)
+  assert.equal(result.checkedFileCount, 20)
+  assert.equal(result.status, '诊断未完成')
+  assert.ok(result.issues.includes('new_file_limit'))
+})
+
+test('file reads stop at twenty MiB and do not silently accept partial records', t => {
+  const f = diagnosticFixture(t)
+  const baseline = captureBaseline(f.options)
+  const path = f.add('large')
+  diagnosticFs.appendFileSync(path, ' '.repeat(diagnosticLimits.bytesPerFile))
+  let readBytes = 0
+  const io = { ...diagnosticFs, readSync(...args) { const bytes = diagnosticFs.readSync(...args); readBytes += bytes; return bytes } }
+  const result = collectDiagnostics({ ...f.options, baseline, io })
+  assert.equal(readBytes, diagnosticLimits.bytesPerFile)
+  assert.equal(result.status, '诊断未完成')
+  assert.ok(result.issues.includes('file_size_limit'))
+})
+
+test('unassociated metadata and task calls with no return remain incomplete', t => {
+  const f = diagnosticFixture(t)
+  const baseline = captureBaseline(f.options)
+  const path = f.add('bad-metadata')
+  writeFileSync(path, '{"type":"session_meta","payload":{}}\n')
+  assert.ok(collectDiagnostics({ ...f.options, baseline }).issues.includes('session_metadata_missing_or_invalid'))
+  f.add('bad-metadata', [{ type: 'response_item', payload: { type: 'function_call', name: 'spawn_agent', call_id: 'missing' } }])
+  const result = collectDiagnostics({ ...f.options, baseline })
+  assert.equal(result.status, '诊断未完成')
+  assert.ok(result.issues.includes('task_return_records_missing'))
+})
+
+test('unknown collaboration event shapes require follow-up rather than claiming no records', t => {
+  const f = diagnosticFixture(t)
+  const baseline = captureBaseline(f.options)
+  f.add('new', [{ type: 'event_msg', payload: { type: 'collab_future_result', body: 'PRIVATE_RETURN' } }])
+  const result = collectDiagnostics({ ...f.options, baseline })
+  assert.equal(result.status, '诊断未完成')
+  assert.ok(result.issues.includes('unrecognized_task_events'))
+  assert.equal(result.sessions[0].eventTypes['event_msg.collab_future_result'], 1)
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_RETURN/)
+})
+
+test('diagnostics never read authentication/config files or follow session symlinks', t => {
+  const f = diagnosticFixture(t)
+  mkdirSync(f.sessions, { recursive: true })
+  writeFileSync(join(f.options.codexHome, 'auth.json'), 'PRIVATE_AUTH')
+  writeFileSync(join(f.options.codexHome, 'config.toml'), 'PRIVATE_CONFIG')
+  const baseline = captureBaseline(f.options)
+  const path = f.add('link')
+  let opened = false
+  const io = { ...diagnosticFs,
+    lstatSync(file) { return file === path ? { isSymbolicLink: () => true } : diagnosticFs.lstatSync(file) },
+    openSync() { opened = true; throw new Error('Should not read symlink') },
+  }
+  const result = collectDiagnostics({ ...f.options, baseline, io })
+  assert.equal(opened, false)
+  assert.ok(result.issues.includes('symlink_skipped'))
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_AUTH|PRIVATE_CONFIG/)
+})
+
+test('diagnostic CLI saves redacted JSON and Summary without changing review results', t => {
+  const f = diagnosticFixture(t)
+  const output = temp(t)
+  const summaryFile = join(output, 'summary.md')
+  const env = { ...process.env, CODEX_HOME: f.options.codexHome, REVIEW_SOURCE_ROOT: f.options.sourceRoot,
+    REVIEW_OUTPUT: output, REVIEW_TRUSTED_ROOT: trustedRoot, REVIEW_REPOSITORY: context.repository,
+    REVIEW_BASE_SHA: context.baseSha, REVIEW_HEAD_SHA: context.headSha, REVIEW_TRUSTED_SHA: context.trustedSha,
+    REVIEW_PR_NUMBER: '1', GITHUB_RUN_ID: context.runId, GITHUB_RUN_ATTEMPT: '1', GITHUB_STEP_SUMMARY: summaryFile,
+    REVIEW_CODEX_OUTCOME: 'failure', DIAGNOSTIC_PRIVATE_ENV: 'PRIVATE_ENV' }
+  const run = mode => spawnSync(process.execPath, [join(trustedRoot, '.github/review/diagnose-host.mjs'), mode], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  assert.equal(run('before').status, 0)
+  f.add('new')
+  const report = failureReport(context, snapshot, 'missing evidence')
+  writeJson(join(output, 'report.json'), report)
+  assert.equal(run('after').status, 0)
+  const result = readJson(join(output, 'diagnostics.json'))
+  assert.equal(result.codexOutcome, 'failure')
+  assert.equal(result.status, '未发现任务记录')
+  assert.deepEqual(readJson(join(output, 'report.json')), report)
+  assert.match(readFileSync(summaryFile, 'utf8'), /不改变审查结论/)
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_ENV/)
+  writeFileSync(join(output, 'diagnostic-baseline.json'), 'bad json')
+  assert.equal(run('after').status, 0)
+  assert.equal(readJson(join(output, 'diagnostics.json')).status, '诊断未完成')
+})
+
+test('workflow keeps diagnostics nonblocking and preserves its existing report publisher', () => {
+  const workflow = readFileSync(join(trustedRoot, '.github/workflows/ai-review.yml'), 'utf8')
+  assert.match(workflow, /name: Diagnose host evidence outlet\r?\n\s+if: always\(\)\r?\n\s+continue-on-error: true/)
+  assert.match(workflow, /name: Record host session baseline[\s\S]*?continue-on-error: true/)
+  assert.match(workflow, /path: \$\{\{ env.REVIEW_OUTPUT \}\}\/\*\.json/)
+  assert.match(workflow, /name: Publish robot comment and PR description/)
 })
