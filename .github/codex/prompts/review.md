@@ -2,6 +2,18 @@
 
 这是一次只读 PR 代码审查，不修改被审查代码，不自动修复。
 
+在生成审查快照之前，先执行以下诊断：
+
+- 输出 node --version、git --version。
+- 在当前项目目录使用 Node child_process.spawnSync，分别启动
+  /bin/true（无参数）和 git rev-parse --show-toplevel。
+- spawnSync 使用 encoding: 'utf8'、maxBuffer: 64 * 1024 * 1024，
+  与工作流的沙箱外探针保持一致。
+- 分别输出 command、status、error.code、error.syscall、error.message、
+  stdout 和 stderr，不输出任何密钥或完整环境变量。
+- 即使探针失败，也保留诊断结果，并按下面流程执行一次快照 helper；
+  helper 失败后严格按 Skill 停止，不重试或自行代审。
+
 1. 从环境变量 REVIEW_BASE_SHA 和 REVIEW_HEAD_SHA 读取审查版本。
 2. 确认当前 HEAD 等于 REVIEW_HEAD_SHA。
 3. 加载并严格执行 .agents/skills/code-review/SKILL.md。

@@ -32,6 +32,39 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Probe Node child processes outside Codex
+        shell: bash
+        run: |
+          node --version
+          git --version
+          node --input-type=module <<'NODE'
+          import { spawnSync } from 'node:child_process'
+
+          let failed = false
+          for (const [command, args] of [
+            ['/bin/true', []],
+            ['git', ['rev-parse', '--show-toplevel']],
+          ]) {
+            const result = spawnSync(command, args, {
+              encoding: 'utf8',
+              maxBuffer: 64 * 1024 * 1024,
+            })
+            console.log(JSON.stringify({
+              command,
+              status: result.status,
+              error: result.error && {
+                code: result.error.code,
+                syscall: result.error.syscall,
+                message: result.error.message,
+              },
+              stdout: result.stdout,
+              stderr: result.stderr,
+            }))
+            if (result.error || result.status !== 0) failed = true
+          }
+          if (failed) process.exitCode = 1
+          NODE
+
       - name: Run project review skill
         id: codex
         uses: openai/codex-action@v1
