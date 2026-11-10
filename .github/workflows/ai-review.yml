@@ -1,7 +1,9 @@
 name: AI Code Review
 
 on:
-  pull_request:
+  # Execute the target branch workflow, not a workflow supplied by the PR.
+  # Same-repository guard below is mandatory; never run PR-provided scripts.
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
@@ -11,86 +13,162 @@ concurrency:
   group: ai-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  REVIEW_REPOSITORY: ${{ github.repository }}
+  REVIEW_PR_NUMBER: ${{ github.event.pull_request.number }}
+  REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+  REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+  REVIEW_TRUSTED_SHA: ${{ github.event.pull_request.base.sha }}
+  REVIEW_TRUSTED_ROOT: ${{ github.workspace }}/trusted
+  REVIEW_SOURCE_ROOT: ${{ github.workspace }}/source
+  REVIEW_OUTPUT: ${{ github.workspace }}/review-output
+
 jobs:
-  review:
-    # 首阶段只处理同仓库 PR；Fork PR 另行设计授权流程。
+  initialize:
+    name: Initialize report
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-
-    env:
-      REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-      REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-
-    outputs:
-      report: ${{ steps.codex.outputs.final-message }}
-
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout trusted target revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
           persist-credentials: false
-
-      - name: Set up Node.js for matching diagnostics
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24.22.2'
-
-      - name: Verify review snapshot helper on Linux
-        shell: bash
-        run: node --test .agents/skills/code-review/scripts/build-review-manifest.test.mjs
-
-      - name: Probe Node child processes outside Codex
+      - name: Verify trusted integration is installed
         shell: bash
         run: |
-          node --version
-          git --version
-          node --input-type=module <<'NODE'
-          import { spawnSync } from 'node:child_process'
+          if [ ! -f "$REVIEW_TRUSTED_ROOT/.github/review/prepare-run.mjs" ]; then
+            echo '目标分支尚未安装第 6 步：请先合并受信任接入代码，再更新或重新运行 PR。'
+            exit 1
+          fi
+          node "$REVIEW_TRUSTED_ROOT/.github/review/prepare-run.mjs" context
+      - name: Reset current PR review state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node "$REVIEW_TRUSTED_ROOT/.github/review/publish-report.mjs" initialize
 
-          let failed = false
-          for (const [command, args] of [
-            ['/bin/true', []],
-            ['git', ['rev-parse', '--show-toplevel']],
-          ]) {
-            const result = spawnSync(command, args, {
-              encoding: 'utf8',
-              maxBuffer: 64 * 1024 * 1024,
-            })
-            console.log(JSON.stringify({
-              command,
-              status: result.status,
-              error: result.error && {
-                code: result.error.code,
-                syscall: result.error.syscall,
-                message: result.error.message,
-              },
-              stdout: result.stdout,
-              stderr: result.stderr,
-            }))
-            if (result.error || result.status !== 0) failed = true
-          }
-          if (failed) process.exitCode = 1
-          NODE
-
-      - name: Install sandbox prerequisite
+  review:
+    name: Review
+    needs: initialize
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted target revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Checkout reviewed revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.22.2'
+      - name: Verify trusted helper and publishing tests on Linux
         shell: bash
+        run: |
+          node --test "$REVIEW_TRUSTED_ROOT/.agents/skills/code-review/scripts/build-review-manifest.test.mjs"
+          node --test "$REVIEW_TRUSTED_ROOT/.github/review/review.test.mjs"
+      - name: Prepare trusted context and shared snapshot
+        id: snapshot
+        run: node "$REVIEW_TRUSTED_ROOT/.github/review/prepare-run.mjs" snapshot
+      - name: Install sandbox prerequisite
+        if: steps.snapshot.outputs.text-count != '0'
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
-          command -v bwrap
-          bwrap --version
-
       - name: Run project review skill
+        if: steps.snapshot.outputs.text-count != '0'
         id: codex
-        uses: openai/codex-action@v1
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # validated v1
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           responses-api-endpoint: https://gptapi001.huasu.org/v1/responses
+          codex-version: '0.167.0'
           model: gpt-6.1-sol
           effort: low
-          prompt-file: .github/codex/prompts/review.md
-          output-file: review-report.md
+          working-directory: ${{ env.REVIEW_SOURCE_ROOT }}
+          prompt-file: ${{ env.REVIEW_TRUSTED_ROOT }}/.github/codex/prompts/review.md
+          output-file: ${{ env.REVIEW_OUTPUT }}/model-report.json
+          codex-args: '["--json", "--config", "project_doc_max_bytes=0", "--output-schema", "${{ env.REVIEW_TRUSTED_ROOT }}/.github/review/report.schema.json"]'
           sandbox: workspace-write
           safety-strategy: drop-sudo
+      - name: Verify reviewed workspace unchanged
+        if: always()
+        run: node "$REVIEW_TRUSTED_ROOT/.github/review/prepare-run.mjs" integrity
+      - name: Preserve review outputs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ai-review-raw-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.REVIEW_OUTPUT }}/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  publish:
+    name: Publish report
+    needs: [initialize, review]
+    if: always() && needs.initialize.result == 'success' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
+    env:
+      REVIEW_INPUT: ${{ github.workspace }}/review-input
+    steps:
+      - name: Checkout trusted publisher
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Checkout reviewed revision for independent scope verification
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.22.2'
+      - name: Download current attempt outputs
+        continue-on-error: true # Missing output becomes an explicit incomplete report.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ai-review-raw-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.REVIEW_INPUT }}
+      - name: Validate host evidence and render report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node "$REVIEW_TRUSTED_ROOT/.github/review/finalize-report.mjs"
+      - name: Publish robot comment and PR description
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node "$REVIEW_TRUSTED_ROOT/.github/review/publish-report.mjs"
+      - name: Preserve complete report and publication result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ai-review-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.REVIEW_OUTPUT }}/
+          if-no-files-found: error
+          retention-days: 30
